@@ -2,6 +2,7 @@
 name = "patch_builder"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
 anyhow = "1"
@@ -14,3 +15,6 @@ path-slash = "0.2"
 indicatif = "0.18"
 rayon = "1.11"
 patch_types = { path = "../patch_types" }
+
+[build-dependencies]
+winres = "0.1"
