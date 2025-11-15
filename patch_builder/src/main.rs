@@ -7,11 +7,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use blake3::Hasher;
 use clap::Parser;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle, MultiProgress, ProgressState};
 use path_slash::PathExt as _;
 use rayon::prelude::*;
+use rayon::{current_num_threads, current_thread_index};
 use walkdir::WalkDir;
 
 use crate::installer::build_installer_exe;
@@ -72,10 +72,20 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn hash_file(path: &Path) -> Result<[u8; 32]> {
-    let mut hasher = Hasher::new();
+fn hash_file(path: &Path, worker_bars: &Arc<Vec<ProgressBar>>) -> Result<[u8; 32]> {
+    // Identify worker
+    let idx = current_thread_index().unwrap_or(0);
+    let bar = &worker_bars[idx];
+
+    let len = std::fs::metadata(path)?.len();
+
+    bar.set_length(len);
+    bar.set_position(0);
+
+    let mut hasher = blake3::Hasher::new();
     let mut file = File::open(path)?;
-    let mut buffer = [0u8; 32];
+    let mut buffer = [0u8; 8192];
+    let mut read_total = 0u64;
 
     loop {
         let n = file.read(&mut buffer)?;
@@ -83,7 +93,10 @@ fn hash_file(path: &Path) -> Result<[u8; 32]> {
             break;
         }
         hasher.update(&buffer[..n]);
+        read_total += n as u64;
+        bar.set_position(read_total);
     }
+
     Ok(*hasher.finalize().as_bytes())
 }
 
@@ -131,7 +144,7 @@ fn build_bundle(
         .collect();
     let new_set: HashSet<String> = new_files.iter().map(|r| r.rel.clone()).collect();
 
-    // Progress bar
+    // Progress bars
     let total_tasks = new_files.len()
         + if delete_extra {
             old_files
@@ -142,29 +155,53 @@ fn build_bundle(
             0
         };
 
-    let pb = Arc::new(ProgressBar::new(total_tasks as u64));
-    pb.set_style(
+    let mp = Arc::new(MultiProgress::new());
+
+    let overall_pb = mp.add(ProgressBar::new(total_tasks as u64));
+    overall_pb.set_style(
         ProgressStyle::with_template(
             "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}",
         )?
             .progress_chars("##-"),
     );
 
+    let num_workers = current_num_threads();
+
+    let mut worker_vec = Vec::with_capacity(num_workers);
+    for i in 0..num_workers {
+        let pb = mp.add(ProgressBar::new(0));
+
+        let template = format!("  [W{:02}] {{bar:30.green/black}} {{bytes}}/{{total_bytes}}", i);
+        pb.set_style(
+            ProgressStyle::with_template(&template)?
+                .with_key("bytes", |st: &ProgressState, w: &mut dyn std::fmt::Write| {
+                    write!(w, "{}", indicatif::HumanBytes(st.pos())).ok();
+                })
+                .with_key("total_bytes", |st: &ProgressState, w: &mut dyn std::fmt::Write| {
+                    write!(w, "{}", indicatif::HumanBytes(st.len().unwrap_or(0))).ok();
+                })
+                .progress_chars("##-"),
+        );
+        worker_vec.push(pb);
+    }
+    let worker_bars = Arc::new(worker_vec);
 
     // Process new files
     let old_map_arc = Arc::new(old_map);
+    let overall_pb = overall_pb.clone();
+    let worker_bars_clone = worker_bars.clone();
+
     let temp_results: Result<Vec<TempResult>> = new_files
         .par_iter()
         .map(|rec| {
-            let pb = pb.clone();
+            let overall_pb = overall_pb.clone();
             let old_map = old_map_arc.clone();
+            let worker_bars = worker_bars_clone.clone();
 
-            pb.set_message(format!("Scanning {}", rec.rel));
-
-            let new_hash = hash_file(&rec.path)?;
+            let new_hash = hash_file(&rec.path, &worker_bars)?;
 
             let res = if let Some(old_path) = old_map.get(&rec.rel) {
-                let old_hash = hash_file(old_path)?;
+                let old_hash = hash_file(old_path, &worker_bars)?;
 
                 if old_hash == new_hash {
                     // unchanged
@@ -196,7 +233,7 @@ fn build_bundle(
                 }
             };
 
-            pb.inc(1);
+            overall_pb.inc(1);
             Ok::<TempResult, anyhow::Error>(res)
         })
         .collect();
@@ -205,15 +242,15 @@ fn build_bundle(
 
     // Delete extra files if --delete-extra was used
     let deleted_entries: Vec<FileEntry> = if delete_extra {
+        let worker_bars = worker_bars.clone();
         old_files
             .par_iter()
             .filter(|rec| !new_set.contains(&rec.rel))
             .map(|rec| {
-                let pb = pb.clone();
-                pb.set_message(format!("Marking deleted {}", rec.rel));
+                let worker_bars = worker_bars.clone();
 
-                let old_hash = hash_file(&rec.path)?;
-                pb.inc(1);
+                let old_hash = hash_file(&rec.path, &worker_bars)?;
+                overall_pb.inc(1);
 
                 Ok::<FileEntry, anyhow::Error>(FileEntry {
                     path: rec.rel.clone(),
@@ -266,7 +303,11 @@ fn build_bundle(
 
     files_vec.extend(deleted_entries);
 
-    pb.finish_with_message("Bundle build complete");
+    overall_pb.finish_with_message("Bundle build complete");
+
+    for (i, wb) in worker_bars.iter().enumerate() {
+        wb.finish_with_message(format!("Worker {i}: done"));
+    }
 
     let manifest = Manifest {
         product: product.to_string(),
@@ -382,4 +423,19 @@ fn create_patch(old_path: &Path, new_path: &Path) -> Result<Vec<u8>> {
 //     };
 //
 //     Ok(PatchBundle { manifest, entries })
+// }
+//
+// fn hash_file(path: &Path) -> Result<[u8; 32]> {
+//     let mut hasher = Hasher::new();
+//     let mut file = File::open(path)?;
+//     let mut buffer = [0u8; 32];
+//
+//     loop {
+//         let n = file.read(&mut buffer)?;
+//         if n == 0 {
+//             break;
+//         }
+//         hasher.update(&buffer[..n]);
+//     }
+//     Ok(*hasher.finalize().as_bytes())
 // }
