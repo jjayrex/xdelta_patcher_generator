@@ -1,5 +1,6 @@
 [workspace]
 members = ["patch_builder", "patch_stub", "patch_types"]
+resolver = "3"
 
 [profile.release]
 opt-level = 3

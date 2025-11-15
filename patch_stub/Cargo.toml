@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-serde = { version = "1", features = ["derive"] }
 xdelta3 = "0.1"
 blake3 = "1.8"
 bincode = "2"
