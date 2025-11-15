@@ -1,0 +1,13 @@
+[package]
+name = "patch_builder"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+xdelta3 = "0.1"
+blake3 = "1.8"
+bincode = "2"
+clap = { version = "4.5", features = ["derive"] }
+patch_types = { path = "../patch_types" }
