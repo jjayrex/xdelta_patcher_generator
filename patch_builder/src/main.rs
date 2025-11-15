@@ -30,11 +30,14 @@ struct Args {
     /// To Version String
     #[arg(long)]
     to_version: String,
+    /// If set, delete files that exist in old_dir but are not present in new_dir
+    #[arg(short = 'd', long)]
+    delete_extra: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let bundle = build_bundle(&args.old_dir, &args.new_dir, &args.product, &args.from_version, &args.to_version)?;
+    let bundle = build_bundle(&args.old_dir, &args.new_dir, &args.product, &args.from_version, &args.to_version, args.delete_extra)?;
     build_installer_exe(&bundle, &args.output)?;
     Ok(())
 }
@@ -59,6 +62,7 @@ fn build_bundle(
     product: &str,
     from_version: &str,
     to_version: &str,
+    delete_extra: bool,
 ) -> Result<PatchBundle> {
     let mut entries = Vec::<PatchData>::new();
     let mut files = Vec::<FileEntry>::new();
@@ -123,14 +127,16 @@ fn build_bundle(
     }
 
     // Deleted files
-    for (rel_str, old_path) in old_map {
-        let old_hash = hash_file(&old_path)?;
-        files.push(FileEntry {
-            path: rel_str,
-            kind: PatchKind::Deleted,
-            original_hash: old_hash,
-            new_hash: [0u8; 32],
-        });
+    if delete_extra {
+        for (rel_str, old_path) in old_map {
+            let old_hash = hash_file(&old_path)?;
+            files.push(FileEntry {
+                path: rel_str,
+                kind: PatchKind::Deleted,
+                original_hash: old_hash,
+                new_hash: [0u8; 32],
+            });
+        }
     }
 
     let manifest = Manifest {
