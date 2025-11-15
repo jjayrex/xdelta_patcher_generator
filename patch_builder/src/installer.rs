@@ -5,7 +5,7 @@ use std::path::Path;
 use bincode;
 use patch_types::PatchBundle;
 
-const PATCH_STUB_EXE: &[u8] = include_bytes!("../patch_stub.exe");
+const PATCH_STUB_EXE: &[u8] = include_bytes!("../../target/release/patch_stub.exe");
 
 pub fn build_installer_exe(bundle: &PatchBundle, output: &Path) -> Result<()> {
     let mut out = File::create(output)?;

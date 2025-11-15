@@ -8,4 +8,6 @@ anyhow = "1"
 xdelta3 = "0.1"
 blake3 = "1.8"
 bincode = "2"
+indicatif = "0.18"
+rayon = "1.11"
 patch_types = { path = "../patch_types" }

@@ -1,11 +1,15 @@
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use blake3;
-use xdelta3;
 use bincode;
+use blake3;
+use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
+use xdelta3;
+
 use patch_types::{PatchBundle, PatchData, PatchKind};
 
 fn main() -> Result<()> {
@@ -44,7 +48,8 @@ fn load_bundle() -> Result<PatchBundle> {
     let mut buffer = vec![0u8; bundle_len as usize];
     file.read_exact(&mut buffer)?;
 
-    let bundle: PatchBundle = bincode::borrow_decode_from_slice(&buffer, bincode::config::standard())?.0;
+    let bundle: PatchBundle =
+        bincode::borrow_decode_from_slice(&buffer, bincode::config::standard())?.0;
     Ok(bundle)
 }
 
@@ -54,7 +59,9 @@ fn hash_file(path: &Path) -> Result<[u8; 32]> {
     let mut buffer = [0u8; 8192];
     loop {
         let n = file.read(&mut buffer)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         hasher.update(&buffer[..n]);
     }
     Ok(*hasher.finalize().as_bytes())
@@ -69,72 +76,181 @@ fn verify_base_folder(bundle: &PatchBundle, cwd: &Path) -> Result<()> {
                     if !path.exists() {
                         anyhow::bail!("Expected file missing: {}", file.path);
                     }
-                    let hash = hash_file(&path).with_context(|| format!("Hashing {}", file.path))?;
+                    let hash =
+                        hash_file(&path).with_context(|| format!("Hashing {}", file.path))?;
                     if hash != file.original_hash {
                         anyhow::bail!("File {} hash mismatch", file.path);
                     }
                 }
             }
-            PatchKind::Added { .. } => {
-
-            }
+            PatchKind::Added { .. } => {}
         }
     }
     Ok(())
 }
 
 fn apply_bundle(bundle: &PatchBundle, cwd: &Path) -> Result<()> {
-    for file in &bundle.manifest.files {
-        let target = cwd.join(&file.path);
+    let total_files = bundle.manifest.files.len() as u64;
+
+    let pb = Arc::new(ProgressBar::new(total_files));
+    pb.set_style(
+        ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}")?
+            .progress_chars("##-"),
+    );
+
+    let base_dir = cwd.to_path_buf();
+    let entries = &bundle.entries;
+    let files = &bundle.manifest.files;
+
+    files.par_iter().try_for_each(|file| {
+        let pb = pb.clone();
+        let base = base_dir.clone();
+
+        pb.set_message(format!("Processing {}", file.path));
+        let target = base.join(&file.path);
 
         match file.kind {
-            PatchKind::Unchanged => {
-
-            },
+            PatchKind::Unchanged => {}
             PatchKind::Deleted => {
                 if target.exists() {
                     fs::remove_file(&target).with_context(|| format!("Removing {}", file.path))?;
                 }
-            },
+            }
             PatchKind::Added { idx } => {
-                if let Some(PatchData::Full(bytes)) = bundle.entries.get(idx) {
-                    if let Some(parent) = target.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    let mut tmp = target.clone();
-                    tmp.set_extension("tmp");
-                    {
-                        let mut out = File::create(&tmp)?;
-                        out.write_all(bytes)?;
-                    }
-                    fs::rename(&tmp, &target)?;
-                } else {
-                    anyhow::bail!("Invalid bundle: 'Added' has wrong data type");
+                let data = entries
+                    .get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid entry index for {}", file.path))?;
+
+                let bytes = match data {
+                    PatchData::Full(b) => b,
+                    _ => anyhow::bail!("'Added' has wrong PatchData type for {}", file.path),
+                };
+
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("Creating dir for {}", file.path))?;
                 }
-            },
-            PatchKind::Patched { idx } => {
-                let org_bytes = {
-                    let mut buffer = Vec::new();
-                    File::open(&target)?.read_to_end(&mut buffer)?;
-                    buffer
-                };
-
-                let patch = match bundle.entries.get(idx) {
-                    Some(PatchData::Xdelta(p)) => p,
-                    _ => anyhow::bail!("Invalid bundle: 'Patched' has wrong data type"),
-                };
-
-                let new_bytes = xdelta3::decode(patch, &org_bytes).context("xdelta decode failed")?;
 
                 let mut tmp = target.clone();
                 tmp.set_extension("tmp");
+
                 {
-                    let mut out = File::create(&tmp)?;
-                    out.write_all(&new_bytes)?;
+                    let mut out = File::create(&tmp)
+                        .with_context(|| format!("Creating temp for {}", file.path))?;
+                    out.write_all(bytes)
+                        .with_context(|| format!("Writing {}", file.path))?;
                 }
-                fs::rename(&tmp, &target)?;
+
+                fs::rename(&tmp, &target).with_context(|| format!("Renaming {}", file.path))?;
+            }
+            PatchKind::Patched { idx } => {
+                let data = entries
+                    .get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid entry index for {}", file.path))?;
+
+                let patch = match data {
+                    PatchData::Xdelta(p) => p,
+                    _ => anyhow::bail!("Patched has wrong PatchData type for {}", file.path),
+                };
+
+                let orig_bytes = {
+                    let mut buf = Vec::new();
+                    let mut f_in = File::open(&target)
+                        .with_context(|| format!("Opening original {}", file.path))?;
+                    f_in.read_to_end(&mut buf)
+                        .with_context(|| format!("Reading original {}", file.path))?;
+                    buf
+                };
+
+                let new_bytes = xdelta3::decode(patch, &orig_bytes)
+                    .with_context(|| format!("xdelta decode failed for {}", file.path))?;
+
+                let mut tmp = target.clone();
+                tmp.set_extension("tmp");
+
+                {
+                    let mut out = File::create(&tmp)
+                        .with_context(|| format!("Creating temp for {}", file.path))?;
+                    out.write_all(&new_bytes)
+                        .with_context(|| format!("Writing patched {}", file.path))?;
+                }
+
+                fs::rename(&tmp, &target).with_context(|| format!("Renaming {}", file.path))?;
             }
         }
-    }
+
+        pb.inc(1);
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    pb.finish_with_message("Patching complete");
     Ok(())
 }
+
+// fn apply_bundle(bundle: &PatchBundle, cwd: &Path) -> Result<()> {
+//     let total_files = bundle.manifest.files.len() as u64;
+//
+//     let pb = ProgressBar::new(total_files);
+//     pb.set_style(
+//         ProgressStyle::with_template(
+//             "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}"
+//         )?
+//         .progress_chars("##-"),
+//     );
+//
+//     for file in &bundle.manifest.files {
+//         let target = cwd.join(&file.path);
+//
+//         match file.kind {
+//             PatchKind::Unchanged => {
+//
+//             },
+//             PatchKind::Deleted => {
+//                 if target.exists() {
+//                     fs::remove_file(&target).with_context(|| format!("Removing {}", file.path))?;
+//                 }
+//             },
+//             PatchKind::Added { idx } => {
+//                 if let Some(PatchData::Full(bytes)) = bundle.entries.get(idx) {
+//                     if let Some(parent) = target.parent() {
+//                         fs::create_dir_all(parent)?;
+//                     }
+//                     let mut tmp = target.clone();
+//                     tmp.set_extension("tmp");
+//                     {
+//                         let mut out = File::create(&tmp)?;
+//                         out.write_all(bytes)?;
+//                     }
+//                     fs::rename(&tmp, &target)?;
+//                 } else {
+//                     anyhow::bail!("Invalid bundle: 'Added' has wrong data type");
+//                 }
+//             },
+//             PatchKind::Patched { idx } => {
+//                 let org_bytes = {
+//                     let mut buffer = Vec::new();
+//                     File::open(&target)?.read_to_end(&mut buffer)?;
+//                     buffer
+//                 };
+//
+//                 let patch = match bundle.entries.get(idx) {
+//                     Some(PatchData::Xdelta(p)) => p,
+//                     _ => anyhow::bail!("Invalid bundle: 'Patched' has wrong data type"),
+//                 };
+//
+//                 let new_bytes = xdelta3::decode(patch, &org_bytes).context("xdelta decode failed")?;
+//
+//                 let mut tmp = target.clone();
+//                 tmp.set_extension("tmp");
+//                 {
+//                     let mut out = File::create(&tmp)?;
+//                     out.write_all(&new_bytes)?;
+//                 }
+//                 fs::rename(&tmp, &target)?;
+//             }
+//         }
+//         pb.inc(1);
+//     }
+//     pb.finish_with_message("Patching complete");
+//     Ok(())
+// }
