@@ -11,13 +11,13 @@ pub struct Manifest {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct FileEntry {
     pub path: String,
-    pub kind: PathKind,
+    pub kind: PatchKind,
     pub original_hash: [u8; 32],
     pub new_hash: [u8; 32],
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub enum PathKind {
+pub enum PatchKind {
     Unchanged,
     Patched { idx: usize },
     Added { idx: usize },
